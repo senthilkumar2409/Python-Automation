@@ -198,14 +198,8 @@ Target: Lambda function (encryption-compliance-checker)
 
 Function is automatically invoked on the configured schedule. No manual action required.
 
-### Invoke via AWS Console (Manual)
 
-1. Open Lambda function
-2. Click **Test** tab
-3. Select or create test event
-4. Click **Test**
-5. View results in execution result
-
+### Lambda function (encryption-compliance-checker)
 ```python
 import os
 import boto3
