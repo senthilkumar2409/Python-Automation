@@ -25,6 +25,8 @@ A serverless Lambda function that automatically scans your AWS infrastructure to
 
 This Lambda function provides **automated encryption compliance auditing** for AWS resources. It scans all EBS volumes and S3 buckets in your AWS account, identifies unencrypted resources, and generates comprehensive compliance reports with actionable recommendations.
 
+**For example:** If we found the EBS volumes or S3 Buckets are Not encrypted, Lambda function will triggers the SNS notification(outlook) to notify the team.
+
 **Use Case:** Ensure all critical infrastructure meets encryption security standards and compliance requirements (SOC 2, HIPAA, PCI-DSS, etc.).
 
 ## ✨ Features
@@ -71,6 +73,19 @@ This Lambda function provides **automated encryption compliance auditing** for A
         └────────────────┘
 ```
 
+## 📚 Tech Stack
+
+| Technology | Version | Purpose |
+|-----------|---------|---------|
+| Python    | 3.13+   | Lambda runtime language |
+| Boto3     | Latest  | AWS SDK for Python |
+| AWS Lambda| -       | Serverless compute |
+| AWS EC2   | -       | EBS volume service |
+| AWS S3    | -       | Object storage service |
+| CloudWatch| -       | Logging & monitoring |
+| EventBridge | -     | Scheduled triggers |
+
+
 ## 📋 Prerequisites
 
 ### AWS Services Required
@@ -78,8 +93,8 @@ This Lambda function provides **automated encryption compliance auditing** for A
 - **AWS EC2** - For EBS volume scanning
 - **AWS S3** - For bucket scanning
 - **AWS CloudWatch** - For logging and monitoring
-- **AWS EventBridge** (optional) - For scheduled triggers
-- **AWS SNS** (optional) - For notifications
+- **AWS EventBridge**  - For scheduled triggers
+- **AWS SNS**  - For notifications
 
 ### Local Development Tools
 - Python 3.13+
@@ -163,17 +178,17 @@ Handler: index.lambda_handler
 Timeout: 60 seconds
 Memory: 512 MB
 Ephemeral Storage: 512 MB
-Environment Variables: (optional)
-  - SEND_NOTIFICATIONS: false
-  - SNS_TOPIC_ARN: arn:aws:sns:region:account:topic-name
+Environment Variables: 
+  - SEND_NOTIFICATIONS: true
+  - SNS_TOPIC_ARN: arn:aws:sns:us-east-1:490004609243:SNS
 ```
 
-### EventBridge Schedule (Optional)
+### EventBridge Schedule 
 
 ```bash
 # Create scheduled rule
 Rule Name: encryption-compliance-daily
-Schedule: cron(0 9 * * ? *)  # Daily at 9 AM UTC
+Schedule: cron(0 9 * * ? *)  # Daily at 1 AM UTC
 Target: Lambda function (encryption-compliance-checker)
 ```
 
@@ -191,179 +206,314 @@ Function is automatically invoked on the configured schedule. No manual action r
 4. Click **Test**
 5. View results in execution result
 
-### Invoke via AWS CLI
-
-```bash
-# Invoke function
-aws lambda invoke \
-  --function-name encryption-compliance-checker \
-  --region us-east-1 \
-  response.json
-
-# View response
-cat response.json
-```
-
-### Invoke via Python (Local Testing)
-
 ```python
+import os
 import boto3
 import json
+import urllib.request
+from datetime import datetime
+from typing import Dict, Any, List
+from botocore.exceptions import ClientError
 
-lambda_client = boto3.client('lambda')
+# Initialize AWS clients (use Lambda region by default)
+ec2_client = boto3.client("ec2")
+s3_client = boto3.client("s3")
+sns_client = boto3.client("sns")
 
-response = lambda_client.invoke(
-    FunctionName='encryption-compliance-checker',
-    InvocationType='RequestResponse',
-    Payload=json.dumps({
-        'source': 'manual-test',
-        'action': 'check-encryption'
-    })
-)
+SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN", "")   # required for SNS notify
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")  # required for Slack notify
 
-result = json.loads(response['Payload'].read())
-print(json.dumps(result, indent=2))
+
+def send_slack_notification(message: str) -> None:
+    """Send Slack message via Incoming Webhook."""
+    if not SLACK_WEBHOOK_URL:
+        print("⚠️ SLACK_WEBHOOK_URL not set; skipping Slack notification")
+        return
+
+    payload = {"text": message}
+    data = json.dumps(payload).encode("utf-8")
+
+    req = urllib.request.Request(
+        SLACK_WEBHOOK_URL,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print(f"✅ Slack notified. HTTP status={resp.status}")
+    except Exception as e:
+        print(f"⚠️ Failed Slack notification: {str(e)}")
+
+
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    try:
+        print(f"Lambda invoked at {datetime.now().isoformat()}")
+        print(f"Event: {json.dumps(event)}")
+
+        unencrypted_ebs = check_ebs_encryption()
+        unencrypted_s3 = check_s3_encryption()
+
+        report = generate_report(unencrypted_ebs, unencrypted_s3)
+
+        # ✅ Send Slack (always: success or non-compliant)
+        send_slack_for_report(report)
+
+        # ✅ Send SNS (only when non-compliant)
+        send_notification(report)
+
+        return {"statusCode": 200, "body": json.dumps(report, indent=2)}
+
+    except Exception as e:
+        error_message = f"Error checking encryption status: {str(e)}"
+        print(f"ERROR: {error_message}")
+
+        # Optional: Slack on failure
+        send_slack_notification(f"⚠️ Encryption audit Lambda failed: {error_message}")
+
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": error_message, "timestamp": datetime.now().isoformat()}),
+        }
+
+
+def check_ebs_encryption() -> List[Dict[str, Any]]:
+    """Check all EBS volumes for encryption status (paginates)."""
+    unencrypted_volumes: List[Dict[str, Any]] = []
+
+    print("\n" + "=" * 60)
+    print("CHECKING EBS VOLUMES ENCRYPTION")
+    print("=" * 60)
+
+    # Use paginator so you don't miss volumes on large accounts. [web:144][web:302]
+    paginator = ec2_client.get_paginator("describe_volumes")
+    total_seen = 0
+
+    for page in paginator.paginate():
+        for volume in page.get("Volumes", []):
+            total_seen += 1
+
+            volume_id = volume["VolumeId"]
+            is_encrypted = volume.get("Encrypted", False)  # EBS encryption flag [web:144]
+            volume_size = volume.get("Size")
+            volume_type = volume.get("VolumeType")
+            state = volume.get("State")
+            availability_zone = volume.get("AvailabilityZone")
+
+            tags = {tag["Key"]: tag["Value"] for tag in volume.get("Tags", [])}
+            volume_name = tags.get("Name", "No Name")
+
+            if not is_encrypted:
+                volume_details = {
+                    "resourceId": volume_id,
+                    "resourceType": "EBS Volume",
+                    "name": volume_name,
+                    "size": f"{volume_size} GB",
+                    "volumeType": volume_type,
+                    "state": state,
+                    "availabilityZone": availability_zone,
+                    "encrypted": is_encrypted,
+                    "message": "⚠️ UNENCRYPTED EBS VOLUME DETECTED",
+                    "severity": "HIGH",
+                    "recommendation": "Create encrypted snapshot and restore to encrypted volume",
+                    "timestamp": datetime.now().isoformat(),
+                }
+                unencrypted_volumes.append(volume_details)
+                print(f"⚠️ Unencrypted EBS: {volume_id} ({volume_name})")
+            else:
+                print(f"✅ EBS encrypted: {volume_id} ({volume_name})")
+
+    print(f"\nTotal EBS volumes scanned: {total_seen}")
+    print(f"Total unencrypted EBS volumes: {len(unencrypted_volumes)}")
+    return unencrypted_volumes
+
+
+def check_s3_encryption() -> List[Dict[str, Any]]:
+    """Check all S3 buckets for default encryption config."""
+    unencrypted_buckets: List[Dict[str, Any]] = []
+
+    print("\n" + "=" * 60)
+    print("CHECKING S3 BUCKETS ENCRYPTION (DEFAULT ENCRYPTION)")
+    print("=" * 60)
+
+    buckets = s3_client.list_buckets().get("Buckets", [])
+    print(f"Total S3 buckets found: {len(buckets)}")
+
+    for bucket in buckets:
+        bucket_name = bucket["Name"]
+        creation_date = bucket.get("CreationDate").isoformat() if bucket.get("CreationDate") else "Unknown"
+
+        try:
+            # If bucket has default encryption, this returns config; otherwise it errors. [web:136][web:143]
+            enc = s3_client.get_bucket_encryption(Bucket=bucket_name)
+            rules = enc.get("ServerSideEncryptionConfiguration", {}).get("Rules", [])
+            if not rules:
+                raise ClientError(
+                    {"Error": {"Code": "ServerSideEncryptionConfigurationNotFoundError", "Message": "No Rules"}},
+                    "GetBucketEncryption",
+                )
+
+            print(f"✅ S3 encrypted by default: {bucket_name}")
+
+        except ClientError as e:
+            # Treat missing encryption config as non-compliant. [web:143]
+            try:
+                loc = s3_client.get_bucket_location(Bucket=bucket_name)
+                region = loc.get("LocationConstraint") or "us-east-1"
+            except Exception:
+                region = "Unknown"
+
+            bucket_details = {
+                "resourceId": bucket_name,
+                "resourceType": "S3 Bucket",
+                "name": bucket_name,
+                "region": region,
+                "creationDate": creation_date,
+                "encrypted": False,
+                "message": "⚠️ UNENCRYPTED S3 BUCKET DETECTED (no default encryption)",
+                "severity": "HIGH",
+                "recommendation": "Enable bucket default encryption (SSE-S3 or SSE-KMS)",
+                "timestamp": datetime.now().isoformat(),
+                "errorCode": e.response.get("Error", {}).get("Code"),
+            }
+            unencrypted_buckets.append(bucket_details)
+            print(f"⚠️ S3 bucket without default encryption: {bucket_name} (region={region})")
+
+    print(f"\nTotal unencrypted S3 buckets: {len(unencrypted_buckets)}")
+    return unencrypted_buckets
+
+
+def generate_report(unencrypted_ebs: List[Dict[str, Any]], unencrypted_s3: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total_unencrypted = len(unencrypted_ebs) + len(unencrypted_s3)
+
+    report = {
+        "timestamp": datetime.now().isoformat(),
+        "summary": {
+            "totalUnencryptedResources": total_unencrypted,
+            "unencryptedEBS": len(unencrypted_ebs),
+            "unencryptedS3": len(unencrypted_s3),
+            "complianceStatus": "COMPLIANT" if total_unencrypted == 0 else "NON-COMPLIANT",
+        },
+        "unencryptedEBSVolumes": unencrypted_ebs,
+        "unencryptedS3Buckets": unencrypted_s3,
+        "nextSteps": [
+            "Review all unencrypted resources",
+            "Enable encryption for all resources",
+            "Set encryption policies to enforce encryption by default",
+            "Schedule regular compliance audits",
+        ],
+    }
+
+    print("\n" + "=" * 60)
+    print("ENCRYPTION COMPLIANCE SUMMARY")
+    print("=" * 60)
+    print(f"Timestamp: {report['timestamp']}")
+    print(f"Total Unencrypted Resources: {total_unencrypted}")
+    print(f"  - Unencrypted EBS Volumes: {len(unencrypted_ebs)}")
+    print(f"  - Unencrypted S3 Buckets: {len(unencrypted_s3)}")
+    print(f"Compliance Status: {report['summary']['complianceStatus']}")
+    print("=" * 60 + "\n")
+
+    return report
+
+
+def send_slack_for_report(report: Dict[str, Any]) -> None:
+    """Slack: success message if compliant, else list resource IDs."""
+    total_unencrypted = report["summary"]["totalUnencryptedResources"]
+
+    if total_unencrypted == 0:
+        send_slack_notification("EBS and S3 resources encrypted ✅")
+        return
+
+    lines = []
+    lines.append("🚨 *AWS Encryption NON-COMPLIANT*")
+    lines.append(f"*Total unencrypted:* {total_unencrypted}")
+    lines.append(f"*EBS unencrypted:* {report['summary']['unencryptedEBS']}")
+    lines.append(f"*S3 unencrypted:* {report['summary']['unencryptedS3']}")
+
+    if report["unencryptedEBSVolumes"]:
+        lines.append("\n*Unencrypted EBS Volume IDs:*")
+        for v in report["unencryptedEBSVolumes"][:25]:
+            lines.append(f"- {v['resourceId']} ({v.get('name', 'No Name')})")
+
+    if report["unencryptedS3Buckets"]:
+        lines.append("\n*S3 Buckets without default encryption:*")
+        for b in report["unencryptedS3Buckets"][:25]:
+            lines.append(f"- {b['resourceId']} (region={b.get('region')})")
+
+    if report["summary"]["unencryptedEBS"] > 25 or report["summary"]["unencryptedS3"] > 25:
+        lines.append("\n(Showing first 25 of each. Check CloudWatch logs for full list.)")
+
+    send_slack_notification("\n".join(lines))
+
+
+def send_notification(report: Dict[str, Any]) -> None:
+    """SNS: send only if unencrypted resources found."""
+    total_unencrypted = report["summary"]["totalUnencryptedResources"]
+    if total_unencrypted <= 0:
+        print("✅ No unencrypted resources; SNS not sent")
+        return
+
+    if not SNS_TOPIC_ARN:
+        print("⚠️ SNS_TOPIC_ARN not set; skipping SNS notification")
+        return
+
+    message = (
+        "AWS ENCRYPTION COMPLIANCE ALERT\n\n"
+        f"Total Unencrypted Resources: {total_unencrypted}\n"
+        f"- Unencrypted EBS Volumes: {report['summary']['unencryptedEBS']}\n"
+        f"- Unencrypted S3 Buckets: {report['summary']['unencryptedS3']}\n\n"
+        f"Status: {report['summary']['complianceStatus']}\n\n"
+        "Please review and enable encryption for all resources.\n"
+    )
+
+    # SNS publish signature: TopicArn + Message (+ Subject optional). [web:291]
+    resp = sns_client.publish(
+        TopicArn=SNS_TOPIC_ARN,
+        Subject="AWS Encryption Compliance Alert",
+        Message=message,
+    )
+    print(f"✅ SNS notification sent. MessageId={resp.get('MessageId')}")
 ```
 
-## 🧪 Test Events
 
-### Test Event 1: EventBridge Scheduled Event
-
-```json
-{
-  "version": "0",
-  "id": "6a7e8feb-b491-4cf7-a9f1-bf3703467718",
-  "detail-type": "Scheduled Event",
-  "source": "aws.events",
-  "account": "123456789012",
-  "time": "2025-12-31T20:30:00Z",
-  "region": "us-east-1",
-  "resources": [
-    "arn:aws:events:us-east-1:123456789012:rule/encryption-compliance-check"
-  ],
-  "detail": {}
-}
-```
-
-### Test Event 2: Custom Manual Trigger
-
-```json
-{
-  "source": "manual-test",
-  "action": "check-encryption",
-  "timestamp": "2025-12-31T20:30:00Z",
-  "region": "us-east-1"
-}
-```
-
-### Test Event 3: Minimal Test
-
-```json
-{
-  "test": true
-}
-```
-
-## 📊 Output Example
-
-### Console Output
+### Function Logs:
 
 ```
 Lambda invoked at 2025-12-31T20:30:00.123456
 Event: {...}
 
+Function Logs:
+START RequestId: 8a67c8e2-f956-4186-a8b1-b8a1757c52e2 Version: $LATEST
+Lambda invoked at 2025-12-31T16:49:19.547292
+Event: {"test": true, "environment": "development"}
 ============================================================
 CHECKING EBS VOLUMES ENCRYPTION
 ============================================================
-Total EBS volumes found: 3
-
-⚠️  UNENCRYPTED EBS VOLUME DETECTED
-  Volume ID: vol-0123456789abcdef0
-  Name: Production-DB
-  Size: 100 GB
-  Type: gp3
-  State: in-use
-  AZ: us-east-1a
-  Encrypted: False
-
-✅ Volume vol-abcdefghij123456 (Backup) is encrypted
-
+⚠️ Unencrypted EBS: vol-0b363ae31d34c48ef (No Name)
+⚠️ Unencrypted EBS: vol-0d06520196f3e9768 (No Name)
+Total EBS volumes scanned: 2
+Total unencrypted EBS volumes: 2
 ============================================================
-CHECKING S3 BUCKETS ENCRYPTION
+CHECKING S3 BUCKETS ENCRYPTION (DEFAULT ENCRYPTION)
 ============================================================
-Total S3 buckets found: 5
-
-⚠️  UNENCRYPTED S3 BUCKET DETECTED
-  Bucket Name: legacy-data-bucket
-  Region: us-east-1
-  Created: 2023-05-10T08:15:00
-  Encrypted: False
-
-✅ Bucket my-encrypted-bucket has encryption enabled
-
+Total S3 buckets found: 1
+✅ S3 encrypted by default: uno-velero
+Total unencrypted S3 buckets: 0
 ============================================================
 ENCRYPTION COMPLIANCE SUMMARY
 ============================================================
-Timestamp: 2025-12-31T20:30:00.123456
+Timestamp: 2025-12-31T16:49:20.052263
 Total Unencrypted Resources: 2
-  - Unencrypted EBS Volumes: 1
-  - Unencrypted S3 Buckets: 1
+- Unencrypted EBS Volumes: 2
+- Unencrypted S3 Buckets: 0
 Compliance Status: NON-COMPLIANT
 ============================================================
+⚠️ SLACK_WEBHOOK_URL not set; skipping Slack notification
+✅ SNS notification sent. MessageId=0acbc41c-e0ad-5876-bc1b-a5d3b6fdda76
 ```
 
-### JSON Response
-
-```json
-{
-  "statusCode": 200,
-  "body": {
-    "timestamp": "2025-12-31T20:30:00.123456",
-    "summary": {
-      "totalUnencryptedResources": 2,
-      "unencryptedEBS": 1,
-      "unencryptedS3": 1,
-      "complianceStatus": "NON-COMPLIANT"
-    },
-    "unencryptedEBSVolumes": [
-      {
-        "resourceId": "vol-0123456789abcdef0",
-        "resourceType": "EBS Volume",
-        "name": "Production-DB",
-        "size": "100 GB",
-        "volumeType": "gp3",
-        "state": "in-use",
-        "availabilityZone": "us-east-1a",
-        "encrypted": false,
-        "message": "⚠️  UNENCRYPTED EBS VOLUME DETECTED",
-        "severity": "HIGH",
-        "recommendation": "Create encrypted snapshot and restore to encrypted volume",
-        "timestamp": "2025-12-31T20:30:00.123456"
-      }
-    ],
-    "unencryptedS3Buckets": [
-      {
-        "resourceId": "legacy-data-bucket",
-        "resourceType": "S3 Bucket",
-        "name": "legacy-data-bucket",
-        "region": "us-east-1",
-        "creationDate": "2023-05-10T08:15:00",
-        "encrypted": false,
-        "message": "⚠️  UNENCRYPTED S3 BUCKET DETECTED",
-        "severity": "HIGH",
-        "recommendation": "Enable bucket encryption (SSE-S3 or SSE-KMS)",
-        "timestamp": "2025-12-31T20:30:00.123456"
-      }
-    ],
-    "nextSteps": [
-      "Review all unencrypted resources",
-      "Enable encryption for all resources",
-      "Set encryption policies to enforce encryption by default",
-      "Schedule regular compliance audits"
-    ]
-  }
-}
-```
 
 ## 🔧 Deployment
 
@@ -374,18 +524,6 @@ Compliance Status: NON-COMPLIANT
 3. Click **Deploy**
 4. Function is live and ready to use
 
-### Deploy via AWS CLI
-
-```bash
-# Create deployment package
-zip lambda.zip index.py
-
-# Deploy
-aws lambda update-function-code \
-  --function-name encryption-compliance-checker \
-  --zip-file fileb://lambda.zip \
-  --region us-east-1
-```
 
 ### Deploy via Terraform
 
@@ -401,135 +539,3 @@ resource "aws_lambda_function" "encryption_checker" {
 }
 ```
 
-## 📡 Monitoring
-
-### CloudWatch Logs
-
-```bash
-# View logs
-aws logs tail /aws/lambda/encryption-compliance-checker --follow
-
-# Search for errors
-aws logs filter-log-events \
-  --log-group-name /aws/lambda/encryption-compliance-checker \
-  --filter-pattern "ERROR"
-```
-
-### CloudWatch Metrics
-
-Monitor:
-- **Duration** - Function execution time
-- **Errors** - Failed invocations
-- **Throttles** - Rate limiting
-- **ConcurrentExecutions** - Concurrent runs
-
-### CloudWatch Dashboard
-
-Create custom dashboard to track:
-- Total unencrypted resources
-- Compliance status trends
-- Scan execution frequency
-- Error rates
-
-## 🔍 Troubleshooting
-
-### Issue: Permission Denied
-
-**Error:** `User: arn:aws:iam::... is not authorized to perform: ec2:DescribeVolumes`
-
-**Solution:**
-```bash
-# Ensure Lambda execution role has correct policy
-# Attach AmazonEC2ReadOnlyAccess and S3ReadOnlyAccess
-```
-
-### Issue: Lambda Timeout
-
-**Error:** `Task timed out after 60.00 seconds`
-
-**Solution:**
-```bash
-# Increase timeout in Lambda configuration
-# Configuration → General Configuration → Timeout → Set to 120 seconds
-```
-
-### Issue: No Resources Found
-
-**Error:** `Total EBS volumes found: 0`
-
-**Solution:**
-- Verify resources exist in the Lambda region
-- Check IAM permissions for resource access
-- Verify AWS credentials are correct
-
-### Issue: S3 Encryption Check Fails
-
-**Error:** `Error checking bucket: NoSuchBucket`
-
-**Solution:**
-- Verify S3 bucket names are correct
-- Check Lambda IAM policy includes S3 permissions
-- Ensure bucket region is accessible
-
-## ✅ Best Practices
-
-1. **Regular Audits**
-   - Schedule compliance checks daily or weekly
-   - Monitor trends over time
-
-2. **Encryption Standards**
-   - Use AWS KMS for sensitive data (SSE-KMS)
-   - Use SSE-S3 for general compliance
-
-3. **Automated Response**
-   - Enable SNS notifications for alerts
-   - Create automated remediation workflows
-
-4. **Documentation**
-   - Document exceptions and approval chains
-   - Maintain audit logs for compliance
-
-5. **Testing**
-   - Test function with sample data before production
-   - Verify IAM permissions in dev environment first
-
-6. **Cost Optimization**
-   - Schedule compliance checks during off-peak hours
-   - Use Lambda reserved concurrency if needed
-
-## 📚 Tech Stack
-
-| Technology | Version | Purpose |
-|-----------|---------|---------|
-| Python    | 3.13+   | Lambda runtime language |
-| Boto3     | Latest  | AWS SDK for Python |
-| AWS Lambda| -       | Serverless compute |
-| AWS EC2   | -       | EBS volume service |
-| AWS S3    | -       | Object storage service |
-| CloudWatch| -       | Logging & monitoring |
-| EventBridge | -     | Scheduled triggers |
-
-## 📝 License
-
-MIT License - Free to use and modify
-
-## 🤝 Contributing
-
-Feel free to fork and submit pull requests for improvements.
-
-## 📞 Support
-
-For issues or questions:
-1. Check CloudWatch Logs for detailed error messages
-2. Verify IAM permissions are correct
-3. Test with sample events in Lambda console
-4. Review AWS documentation for service limits
-
----
-
-**Last Updated:** December 31, 2025  
-**Author:** DevOps Team  
-**Status:** Production Ready ✅
-```
-
-This README provides comprehensive documentation covering all aspects of the encryption compliance checker function. You can customize it further based on your specific organizational needs.
