@@ -37,6 +37,7 @@ This Lambda function provides **automated encryption compliance auditing** for A
 
 ## 🏗️ Architecture
 
+<img width="2996" height="873" alt="image" src="https://github.com/user-attachments/assets/7e750dba-0f78-42b8-9400-5e92ebc393f3" />
 
 
 ## 📚 Tech Stack
