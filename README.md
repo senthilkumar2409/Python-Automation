@@ -1,5 +1,5 @@
 # Python Scripting (Automation) - Compliance check
-```markdown
+
 # AWS Encryption Compliance Checker
 
 A serverless Lambda function that automatically scans your AWS infrastructure to identify **unencrypted EBS volumes** and **S3 buckets**, providing detailed compliance reports and recommendations.
