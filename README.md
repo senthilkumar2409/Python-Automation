@@ -478,14 +478,6 @@ Compliance Status: NON-COMPLIANT
 
 ## 🔧 Deployment
 
-### Deploy via AWS Console
-
-1. Open Lambda function
-2. Copy Python code into editor
-3. Click **Deploy**
-4. Function is live and ready to use
-
-
 ### Deploy via Terraform
 
 ```hcl
