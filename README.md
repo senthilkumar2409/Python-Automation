@@ -13,13 +13,8 @@ A serverless Lambda function that automatically scans your AWS infrastructure to
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Usage](#usage)
-- [Test Events](#test-events)
 - [Output Example](#output-example)
 - [Deployment](#deployment)
-- [Monitoring](#monitoring)
-- [Troubleshooting](#troubleshooting)
-- [Best Practices](#best-practices)
-- [License](#license)
 
 ## 🎯 Overview
 
